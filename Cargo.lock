@@ -3062,7 +3062,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-smart-tabs"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "kdl 6.5.0",
  "log",
