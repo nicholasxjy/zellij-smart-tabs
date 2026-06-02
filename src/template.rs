@@ -15,12 +15,18 @@ pub struct TemplateRenderer {
     format: String,
 }
 
-impl TemplateRenderer {
-    pub fn new() -> Self {
+impl Default for TemplateRenderer {
+    fn default() -> Self {
         Self {
             env: Environment::new(),
             format: String::new(),
         }
+    }
+}
+
+impl TemplateRenderer {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Update the cached format string.

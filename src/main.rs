@@ -184,6 +184,7 @@ impl ZellijSmartTabsPlugin {
                 .get(first.status.as_str())
                 .map(|s| s.as_str())
                 .unwrap_or(first.status.as_str());
+            // 6 pane fields + 1 "pane" array entry
             let mut map = serde_json::Map::with_capacity(7);
             map.insert("cwd".into(), serde_json::json!(first.cwd));
             map.insert("short_dir".into(), serde_json::json!(first.short_dir));
