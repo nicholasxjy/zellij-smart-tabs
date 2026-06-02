@@ -8,7 +8,45 @@ pub fn validate_format(format: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Render a tab name from a format string and a context value.
+/// A cached template renderer that reuses a single MiniJinja Environment
+/// instead of creating a new one on every render call.
+pub struct TemplateRenderer {
+    env: Environment<'static>,
+    format: String,
+}
+
+impl Default for TemplateRenderer {
+    fn default() -> Self {
+        Self {
+            env: Environment::new(),
+            format: String::new(),
+        }
+    }
+}
+
+impl TemplateRenderer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update the cached format string.
+    pub fn set_format(&mut self, format: &str) {
+        if self.format != format {
+            self.format = format.to_string();
+        }
+    }
+
+    /// Render using the cached Environment (avoids re-creating it each call).
+    pub fn render(&self, context: &Value) -> String {
+        if self.format.is_empty() {
+            return String::new();
+        }
+        self.env.render_str(&self.format, context).unwrap_or_default()
+    }
+}
+
+/// Render a tab name from a format string and a context value (used in tests).
+#[cfg(test)]
 pub fn render(format: &str, context: &Value) -> String {
     let env = Environment::new();
     env.render_str(format, context).unwrap_or_default()

@@ -43,6 +43,8 @@ struct ZellijSmartTabsPlugin {
     version_error: Option<String>,
     /// Cached $HOME for tilde-replacing display paths. None if env unavailable.
     home_dir: Option<String>,
+    /// Cached template renderer to avoid re-creating MiniJinja Environment on every render.
+    renderer: template::TemplateRenderer,
 }
 
 #[cfg(not(test))]
@@ -61,6 +63,7 @@ impl Default for ZellijSmartTabsPlugin {
             last_rename: None,
             version_error: None,
             home_dir: std::env::var("HOME").ok(),
+            renderer: template::TemplateRenderer::new(),
         }
     }
 }
@@ -116,7 +119,7 @@ impl ZellijSmartTabsPlugin {
     }
 
     fn initialize(&mut self, configuration: BTreeMap<String, String>) {
-        self.config = Some(Config::from_map(&configuration));
+        self.set_config(Config::from_map(&configuration));
         logging::init();
         logging::set_debug(self.config().debug);
         self.warn_format_error();
@@ -125,6 +128,11 @@ impl ZellijSmartTabsPlugin {
 
     fn config(&self) -> &Config {
         self.config.as_ref().expect("config not initialized")
+    }
+
+    fn set_config(&mut self, config: Config) {
+        self.renderer.set_format(&config.format);
+        self.config = Some(config);
     }
 
     fn schedule_next_timer(&self) {
@@ -158,8 +166,8 @@ impl ZellijSmartTabsPlugin {
         let pane_to_json = |p: &PaneState| -> serde_json::Value {
             let status = status_subs
                 .get(p.status.as_str())
-                .cloned()
-                .unwrap_or_else(|| p.status.as_str().to_string());
+                .map(|s| s.as_str())
+                .unwrap_or(p.status.as_str());
             serde_json::json!({
                 "cwd": p.cwd,
                 "short_dir": p.short_dir,
@@ -170,13 +178,26 @@ impl ZellijSmartTabsPlugin {
             })
         };
 
-        let pane_array: Vec<serde_json::Value> = panes.iter().map(|p| pane_to_json(p)).collect();
-
-        // Top-level aliases from first pane
-        let mut ctx = match pane_array.first() {
-            Some(serde_json::Value::Object(first)) => first.clone(),
-            _ => serde_json::Map::new(),
+        // Build top-level context directly from first pane to avoid cloning
+        let mut ctx = if let Some(first) = panes.first() {
+            let status = status_subs
+                .get(first.status.as_str())
+                .map(|s| s.as_str())
+                .unwrap_or(first.status.as_str());
+            // 6 pane fields + 1 "pane" array entry
+            let mut map = serde_json::Map::with_capacity(7);
+            map.insert("cwd".into(), serde_json::json!(first.cwd));
+            map.insert("short_dir".into(), serde_json::json!(first.short_dir));
+            map.insert("git_root".into(), serde_json::json!(first.git_root));
+            map.insert("short_git_root".into(), serde_json::json!(first.short_git_root));
+            map.insert("program".into(), serde_json::json!(first.program));
+            map.insert("status".into(), serde_json::json!(status));
+            map
+        } else {
+            serde_json::Map::new()
         };
+
+        let pane_array: Vec<serde_json::Value> = panes.iter().map(|p| pane_to_json(p)).collect();
         ctx.insert("pane".into(), serde_json::Value::Array(pane_array));
 
         minijinja::Value::from_serialize(&ctx)
@@ -199,7 +220,7 @@ impl ZellijSmartTabsPlugin {
         }
 
         let ctx = self.build_template_context(tab_id);
-        let name = template::render(&self.config().format, &ctx);
+        let name = self.renderer.render(&ctx);
         if !name.is_empty() && state.name != name {
             debug!(tab_id = tab_id, name = name.as_str(); "rename tab");
             self.host.rename_tab(tab_id as u64, name.clone());
@@ -475,27 +496,38 @@ impl ZellijSmartTabsPlugin {
         for pane_id in pane_ids {
             let raw_cmd = self.host.get_pane_running_command(pane_id).ok();
             let running_command = raw_cmd.as_ref().map(|cmd| cmd.join(" "));
-            let raw_program = raw_cmd.and_then(|cmd| {
-                let tokens: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-                extract_program(&tokens, &self.config().skip_programs)
-            });
-            let new_program = self.substitute_program(raw_program);
-            if let Some(pane) = self.pane_store.panes.get_mut(&pane_id) {
-                pane.running_command = running_command;
-                if pane.program != new_program {
-                    debug!(pane_id = pane_id, program = format!("{:?}", new_program).as_str(); "program changed");
-                    changed_tabs.insert(pane.tab_id);
-                    pane.program = new_program;
+
+            // Skip processing if the running command hasn't changed
+            let cmd_unchanged = self
+                .pane_store
+                .panes
+                .get(&pane_id)
+                .map(|p| p.running_command == running_command)
+                .unwrap_or(false);
+
+            if !cmd_unchanged {
+                let raw_program = raw_cmd.and_then(|cmd| {
+                    let tokens: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+                    extract_program(&tokens, &self.config().skip_programs)
+                });
+                let new_program = self.substitute_program(raw_program);
+                if let Some(pane) = self.pane_store.panes.get_mut(&pane_id) {
+                    pane.running_command = running_command;
+                    if pane.program != new_program {
+                        debug!(pane_id = pane_id, program = format!("{:?}", new_program).as_str(); "program changed");
+                        changed_tabs.insert(pane.tab_id);
+                        pane.program = new_program;
+                    }
                 }
             }
 
-            // Refresh git info for panes with CWD on auto-managed tabs
+            // Only refresh git info for panes on active managed tabs (reduces subprocess calls)
             let should_refresh_git = self.pane_store.panes.get(&pane_id).and_then(|p| {
                 if p.raw_cwd.is_some() {
                     self.tab_store
                         .tabs
                         .get(&p.tab_id)
-                        .filter(|t| t.is_managed)
+                        .filter(|t| t.is_managed && t.is_active)
                         .map(|_| p.raw_cwd.as_deref().unwrap().to_string())
                 } else {
                     None
@@ -615,7 +647,7 @@ impl ZellijSmartTabsPlugin {
                 true
             }
             Event::PluginConfigurationChanged(configuration) => {
-                self.config = Some(Config::from_map(&configuration));
+                self.set_config(Config::from_map(&configuration));
                 logging::set_debug(self.config().debug);
                 debug!("config reloaded");
                 self.warn_format_error();
@@ -813,6 +845,7 @@ mod tests {
             last_rename: None,
             version_error: None,
             home_dir: None,
+            renderer: template::TemplateRenderer::new(),
         }
     }
 
@@ -854,7 +887,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         // 1. TabUpdate: register the tab
@@ -888,7 +921,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         // Setup: tab + pane + CWD → auto rename fires once
@@ -925,7 +958,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         // Setup tab + pane + CWD
@@ -967,7 +1000,7 @@ mod tests {
         mock.expect_set_timeout().returning(|_| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         // Tab + pane registered but no CWD yet
@@ -994,7 +1027,7 @@ mod tests {
         mock.expect_hide_self().times(1).returning(|| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
 
         plugin.handle_event(Event::Key(KeyWithModifier::new(BareKey::Esc)));
     }
@@ -1012,7 +1045,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
 
         // Events arrive before permissions — data stored, renames scheduled
         plugin.handle_event(Event::TabUpdate(vec![tab_info(1, 0, "Tab #1")]));
@@ -1064,7 +1097,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         plugin.handle_event(Event::TabUpdate(vec![tab_info(1, 0, "Tab #1")]));
@@ -1095,7 +1128,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         plugin.handle_event(Event::TabUpdate(vec![tab_info(1, 0, "Tab #1")]));
@@ -1126,7 +1159,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         plugin.handle_event(Event::TabUpdate(vec![tab_info(1, 0, "Tab #1")]));
@@ -1166,7 +1199,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         plugin.handle_event(Event::TabUpdate(vec![tab_info(1, 0, "Tab #1")]));
@@ -1205,7 +1238,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         plugin.handle_event(Event::TabUpdate(vec![tab_info(1, 0, "Tab #1")]));
@@ -1252,7 +1285,7 @@ mod tests {
         mock.expect_run_command().returning(|_, _, _, _| ());
 
         let mut plugin = make_plugin(mock);
-        plugin.config = Some(Config::from_map(&default_config()));
+        plugin.set_config(Config::from_map(&default_config()));
         plugin.permissions_granted = true;
 
         // Tab is active initially
@@ -1306,7 +1339,7 @@ mod tests {
         let mut plugin = make_plugin_with_home(mock, Some("/home/user".into()));
         let mut cfg = default_config();
         cfg.insert("format".into(), "{{ short_git_root }}".into());
-        plugin.config = Some(Config::from_map(&cfg));
+        plugin.set_config(Config::from_map(&cfg));
         plugin.permissions_granted = true;
 
         plugin.handle_event(Event::TabUpdate(vec![tab_info(1, 0, "Tab #1")]));
@@ -1391,7 +1424,7 @@ mod tests {
             mock.expect_run_command().returning(|_, _, _, _| ());
 
             let mut plugin = make_plugin_with_home(mock, case.home);
-            plugin.config = Some(Config::from_map(&default_config()));
+            plugin.set_config(Config::from_map(&default_config()));
             plugin.permissions_granted = true;
 
             plugin.handle_event(Event::TabUpdate(vec![tab_info(1, 0, "Tab #1")]));
