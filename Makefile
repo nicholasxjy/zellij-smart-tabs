@@ -7,10 +7,10 @@ WASM_DEV = target/$(WASM_TARGET)/debug/$(PLUGIN_NAME).wasm
 WASM_RELEASE = target/$(WASM_TARGET)/release/$(PLUGIN_NAME).wasm
 
 build:
-	cargo build --release
+	cargo build --release --target $(WASM_TARGET)
 
 build-dev:
-	cargo build
+	cargo build --target $(WASM_TARGET)
 
 dev: clean-cache build-dev
 	zellij -n dev-layout.kdl --session smart-tabs-dev
